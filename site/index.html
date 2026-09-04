@@ -7,16 +7,10 @@
     <meta name="description" content="Turn paper introductions into compact, beautifully rendered learning resources.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,400;1,9..144,500;1,9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="bg-orbs" aria-hidden="true">
-        <div class="orb orb-1"></div>
-        <div class="orb orb-2"></div>
-        <div class="orb orb-3"></div>
-    </div>
-
     <nav class="navbar">
         <div class="nav-inner">
             <a href="#" class="nav-brand">
@@ -25,6 +19,7 @@
             </a>
             <div class="nav-right">
                 <span class="nav-pill" id="nav-count">— papers</span>
+                <a href="#how" class="nav-link">How it works</a>
                 <a href="https://arxiv.org" target="_blank" rel="noopener" class="nav-link">arXiv ↗</a>
             </div>
         </div>
@@ -32,35 +27,81 @@
 
     <header class="hero">
         <div class="hero-inner">
-            <span class="hero-eyebrow">100 latest papers · Large Language Models</span>
-            <h1 class="hero-title">Research, distilled into <em>learning stories</em>.</h1>
-            <p class="hero-sub">Each paper's introduction is turned into a compact, structured learning note — so you grasp the field without wading through dense prose.</p>
+            <div class="hero-copy">
+                <span class="hero-eyebrow"><span class="eyebrow-dot"></span> 100 latest papers · Large Language Models</span>
+                <h1 class="hero-title">Research, distilled into <em>learning stories</em>.</h1>
+                <p class="hero-sub">Each paper's introduction is turned into a compact, structured learning note — so you grasp the field without wading through dense prose.</p>
 
-            <div class="hero-search">
-                <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <circle cx="11" cy="11" r="8"></circle>
-                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-                </svg>
-                <input type="text" id="search-input" placeholder="Search by title, topic, keyword…" autocomplete="off">
-                <kbd class="search-kbd">⌘ K</kbd>
+                <div class="hero-search">
+                    <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                    <input type="text" id="search-input" placeholder="Search by title, topic, keyword…" autocomplete="off">
+                    <kbd class="search-kbd">⌘ K</kbd>
+                </div>
+
+                <div class="hero-stats">
+                    <div class="stat">
+                        <span class="stat-num" id="stat-papers">0</span>
+                        <span class="stat-label">papers</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-num" id="stat-notes">0</span>
+                        <span class="stat-label">learning notes</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-num" id="stat-cites">0</span>
+                        <span class="stat-label">citations</span>
+                    </div>
+                </div>
             </div>
 
-            <div class="hero-stats">
-                <div class="stat">
-                    <span class="stat-num" id="stat-papers">0</span>
-                    <span class="stat-label">papers</span>
+            <div class="hero-art" aria-hidden="true">
+                <div class="stack stack-back">
+                    <span class="stack-title">…</span>
                 </div>
-                <div class="stat">
-                    <span class="stat-num" id="stat-notes">0</span>
-                    <span class="stat-label">learning notes</span>
+                <div class="stack stack-mid">
+                    <span class="stack-title">…</span>
+                    <span class="stack-line"></span>
                 </div>
-                <div class="stat">
-                    <span class="stat-num" id="stat-cites">0</span>
-                    <span class="stat-label">citations</span>
+                <div class="stack stack-front">
+                    <span class="stack-logo">Δ</span>
+                    <span class="stack-title">Paper Gist</span>
+                    <span class="stack-lines">
+                        <i></i><i></i><i></i><i></i><i></i>
+                    </span>
+                    <span class="stack-tag">learning</span>
                 </div>
             </div>
         </div>
     </header>
+
+    <section class="how-it-works" id="how" aria-label="How it works">
+        <div class="how-inner">
+            <div class="how-step">
+                <span class="how-num">01</span>
+                <div>
+                    <h3>Papers streamed in</h3>
+                    <p>The library stays fresh automatically — fetched from arXiv by GitHub Actions.</p>
+                </div>
+            </div>
+            <div class="how-step">
+                <span class="how-num">02</span>
+                <div>
+                    <h3>Notes built on demand</h3>
+                    <p>Each introduction becomes a structured learning note: problem, prior work, table, timeline.</p>
+                </div>
+            </div>
+            <div class="how-step">
+                <span class="how-num">03</span>
+                <div>
+                    <h3>Read, study, grasp</h3>
+                    <p>Open any card for the full note — no sign-up, no backend, fully static.</p>
+                </div>
+            </div>
+        </div>
+    </section>
 
     <main class="container">
         <div class="toolbar reveal">
@@ -83,7 +124,7 @@
         <div id="paper-list" class="paper-list"></div>
 
         <div id="empty-state" class="empty-state hidden">
-            <div class="empty-emoji">🏻‍♂️</div>
+            <div class="empty-emoji">✻</div>
             <p>No papers match your search.</p>
         </div>
     </main>

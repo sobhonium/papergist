@@ -45,9 +45,9 @@ function tableHtml(rows) {
             .map((c) => c.trim());
     const headRow = rows[0];
     const bodyRows = rows.filter((r) => !/^\s*\|[\s:|-]+\|\s*$/.test(r)).slice(1);
-    const head = toCells(headRow).map((c) => `<th>${c}</th>`).join("");
+    const head = toCells(headRow).map((c) => `<th>${inline(c)}</th>`).join("");
     const trs = bodyRows
-        .map((row) => `<tr>${toCells(row).map((c) => `<td>${c}</td>`).join("")}</tr>`)
+        .map((row) => `<tr>${toCells(row).map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`)
         .join("");
     return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${trs}</tbody></table></div>`;
 }
@@ -117,7 +117,7 @@ function renderMarkdown(text) {
             para.push(l);
             i++;
         }
-        blocks.push(`<p>${para.join("<br>")}</p>`);
+        blocks.push(`<p>${inline(para.join("<br>"))}</p>`);
     }
 
     return blocks.join("\n");
@@ -155,6 +155,15 @@ function topicsFromGist(gist) {
 function formatCitations(n) {
     if (n === null || n === undefined) return null;
     return n === 0 ? "0 citations" : `${n} citation${n === 1 ? "" : "s"}`;
+}
+
+const CAT_ACCENTS = ["#d98e24", "#a63d24", "#2e7568", "#3a6ca3", "#77517f", "#5c7a38"];
+
+function accentFor(field) {
+    const key = String(field || "Research").toLowerCase();
+    let h = 0;
+    for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+    return CAT_ACCENTS[h % CAT_ACCENTS.length];
 }
 
 function renderFilters() {
@@ -231,6 +240,7 @@ function render() {
     papers.forEach((p, i) => {
         const card = document.createElement("article");
         card.className = "paper-card";
+        card.style.setProperty("--cat", accentFor(p.field));
         card.style.animationDelay = `${Math.min(i * 45, 400)}ms`;
         const topics = topicsFromGist(p.gist);
         const cites = formatCitations(p.citations);
@@ -280,16 +290,45 @@ function openModal(p) {
             }
         </div>
         <div class="abstract-box">${escapeHtml(p.summary)}</div>
+        <div class="reader-toolbar">
+            <button class="reader-btn" id="zoomin-btn" type="button">A +</button>
+            <button class="reader-btn" id="zoomout-btn" type="button">A −</button>
+            <span class="reader-sep"></span>
+            <button class="reader-btn copy-btn" id="copy-btn" type="button">Copy note</button>
+        </div>
         ${body}
     `;
     modal.classList.remove("hidden");
+    modalContent.style.setProperty("--reader-scale", "1");
     modalContent.scrollTop = 0;
+    openModal._lastFocus = document.activeElement;
     const closeBtn = modalContent.querySelector(".close-btn");
     closeBtn.addEventListener("click", closeModal);
+    closeBtn.focus();
+
+    const zoomIn = modalContent.querySelector("#zoomin-btn");
+    const zoomOut = modalContent.querySelector("#zoomout-btn");
+    const copyBtn = modalContent.querySelector("#copy-btn");
+    let scale = 1;
+    zoomIn.addEventListener("click", () => {
+        scale = Math.min(1.35, +(scale + 0.05).toFixed(2));
+        modalContent.style.setProperty("--reader-scale", scale);
+    });
+    zoomOut.addEventListener("click", () => {
+        scale = Math.max(0.8, +(scale - 0.05).toFixed(2));
+        modalContent.style.setProperty("--reader-scale", scale);
+    });
+    copyBtn.addEventListener("click", () => {
+        navigator.clipboard
+            .writeText(p.gist || `${p.title}\n\n${p.summary}`)
+            .then(() => showToast(p.gist ? "Learning note copied" : "Abstract copied"))
+            .catch(() => showToast("Could not copy"));
+    });
 }
 
 function closeModal() {
     modal.classList.add("hidden");
+    if (openModal._lastFocus && openModal._lastFocus.focus) openModal._lastFocus.focus();
 }
 
 async function init() {
@@ -315,12 +354,32 @@ async function init() {
     const notes = state.papers.filter((p) => p.gist).length;
     const totalCites = state.papers.reduce((s, p) => s + (p.citations || 0), 0);
     navCount.textContent = `${state.papers.length} papers`;
-    statPapers.textContent = formatComma(state.papers.length);
-    statNotes.textContent = formatComma(notes);
-    statCites.textContent = formatComma(totalCites);
+    animateCount(statPapers, state.papers.length);
+    animateCount(statNotes, notes);
+    animateCount(statCites, totalCites);
 
+    fillHeroArt();
     renderFilters();
     render();
+}
+
+function animateCount(el, target, duration = 800) {
+    const start = performance.now();
+    const from = 0;
+    function tick(now) {
+        const t = Math.min(1, (now - start) / duration);
+        const eased = 1 - Math.pow(1 - t, 3);
+        el.textContent = formatComma(Math.round(from + (target - from) * eased));
+        if (t < 1) requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+}
+
+function fillHeroArt() {
+    const backs = document.querySelectorAll(".stack-back .stack-title, .stack-mid .stack-title");
+    if (backs.length < 2 || state.papers.length < 2) return;
+    backs[0].textContent = state.papers[0].title;
+    backs[1].textContent = state.papers[1].title;
 }
 
 searchEl.addEventListener("input", (e) => {
