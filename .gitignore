@@ -5,9 +5,15 @@ __pycache__/
 .venv/
 venv/
 
+# env var
+.env
+
 # Jupyter
 .ipynb_checkpoints/
 
 # OS / editor
 .DS_Store
 *.swp
+
+# opencode
+.opencode/
