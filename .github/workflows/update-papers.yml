@@ -60,3 +60,12 @@ jobs:
           else
             echo "No new papers — data.json unchanged, nothing to commit."
           fi
+
+      
+      - name: Notify Slack
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{
+            "text": "Paper gist is just updated."
+          }' \
+          ${{ secrets.SLACK_WEBHOOK_URL }}    
