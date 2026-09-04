@@ -1,39 +1,26 @@
-"""Paper Gist — API server and CLI pipeline.
+"""Paper Gist pipeline.
 
-Runs as a Flask API that serves arXiv papers on the fly and generates
-learning gists via Groq when requested. Also supports the original CLI
-batch mode for offline processing.
+Fetches the latest arXiv papers matching "large language model", dedupes
+against the existing site/data.json by arXiv id, generates learning gists
+for a configurable number of NEW papers, pulls citation counts from Semantic
+Scholar, and merges the results into site/data.json.
 
-Usage (API server):
-    python pipeline.py
-    python pipeline.py --port 5000
-
-Usage (CLI batch mode):
-    python pipeline.py --cli --fetch 100 --new 10
+Usage:
+    python pipeline.py --fetch 100 --new 10
 """
 
 import argparse
-import io
 import json
-import os
 import re
 import sys
-import tarfile
 import time
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import arxiv
 import requests
-from flask import Flask, jsonify, request
-from flask_cors import CORS
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
+SITE_JSON = Path(__file__).resolve().parent / "site" / "data.json"
 GROQ_MODEL = "qwen/qwen3.6-27b"
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
-ARXIV_SEARCH_QUERY = 'all:"large language model"'
 
 SYSTEM_PROMPT = """You are an expert research tutor who writes for advanced undergraduates.
 
@@ -84,95 +71,46 @@ STYLE RULES:
 - Keep the total output under 800 words.
 """
 
-SITE_JSON = Path(__file__).resolve().parent / "site" / "data.json"
 
 # ---------------------------------------------------------------------------
-# arXiv fetching (Atom feed, no library needed)
+# arXiv fetching
 # ---------------------------------------------------------------------------
 
-ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+def arxiv_client():
+    return arxiv.Client(page_size=100, delay_seconds=3, num_retries=3)
 
 
-def fetch_papers_from_arxiv(max_results=100, retries=3, delay=3):
-    """Fetch latest papers from the arXiv Atom feed. Returns a list of dicts."""
-    params = {
-        "search_query": ARXIV_SEARCH_QUERY,
-        "start": 0,
-        "max_results": max_results,
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    }
-    resp = None
-    for attempt in range(retries):
-        try:
-            resp = requests.get(ARXIV_API_URL, params=params, timeout=30)
-        except Exception as e:
-            print(f"  arXiv request error: {e} (attempt {attempt+1}/{retries})")
-            time.sleep(delay * (attempt + 1))
-            continue
-        if resp.status_code == 200:
-            break
-        if resp.status_code == 429:
-            wait = delay * (attempt + 1)
-            print(f"  arXiv rate-limited (429), waiting {wait}s...")
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-    if resp is None or resp.status_code != 200:
-        raise Exception(f"arXiv API failed after {retries} retries")
-
-    root = ET.fromstring(resp.text)
-    papers = []
-    for entry in root.findall("atom:entry", ATOM_NS):
-        title_el = entry.find("atom:title", ATOM_NS)
-        summary_el = entry.find("atom:summary", ATOM_NS)
-        published_el = entry.find("atom:published", ATOM_NS)
-        id_el = entry.find("atom:id", ATOM_NS)
-
-        if id_el is None or id_el.text is None:
-            continue
-
-        arxiv_url = id_el.text.strip()
-
-        # Extract short_id from URL (e.g. http://arxiv.org/abs/2609.02859v1 -> 2609.02859v1)
-        short_id = arxiv_url.split("/abs/")[-1] if "/abs/" in arxiv_url else ""
-
-        # Extract authors
-        authors = []
-        for author_el in entry.findall("atom:author", ATOM_NS):
-            name_el = author_el.find("atom:name", ATOM_NS)
-            if name_el is not None and name_el.text:
-                authors.append(name_el.text.strip())
-
-        # Extract primary category
-        primary_cat = ""
-        cat_el = entry.find("{http://arxiv.org/schemas/atom}primary_category")
-        if cat_el is not None:
-            primary_cat = cat_el.get("term", "")
-
-        # Clean up title (replace newlines, collapse whitespace)
-        title = " ".join((title_el.text or "").split()) if title_el is not None else ""
-        summary = " ".join((summary_el.text or "").split()) if summary_el is not None else ""
-        published = published_el.text.strip() if published_el is not None and published_el.text else ""
-
-        papers.append({
-            "title": title,
-            "field": "Large Language Models",
-            "published": published,
-            "url": arxiv_url,
-            "short_id": short_id,
-            "summary": summary,
-            "authors": authors,
-            "primary_category": primary_cat,
-            "citations": None,
-        })
-
-    papers.sort(key=lambda p: p["published"], reverse=True)
+def fetch_latest_n(max_results=100):
+    """Return the latest `max_results` papers matching 'large language model'."""
+    client = arxiv_client()
+    search = arxiv.Search(
+        query='all:"large language model"',
+        max_results=max_results,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Descending,
+    )
+    papers = list(client.results(search))
+    # arxiv returns newest first; be defensive and sort by published desc.
+    papers.sort(key=lambda p: p.published, reverse=True)
     return papers
 
 
+def paper_to_meta(paper):
+    """Convert an arxiv Result into a site record (no gist yet)."""
+    return {
+        "title": paper.title.strip(),
+        "field": "Large Language Models",
+        "published": paper.published.isoformat(),
+        "url": paper.entry_id,
+        "short_id": paper.get_short_id(),
+        "summary": paper.summary.strip(),
+        "citations": None,
+        "has_gist": False,
+    }
+
+
 # ---------------------------------------------------------------------------
-# TeX extraction and Groq gist generation
+# Gist generation (Groq)
 # ---------------------------------------------------------------------------
 
 def get_introduction(tex):
@@ -190,10 +128,14 @@ def download_arxiv_source(arxiv_id, timeout=60):
 
 def extract_tex_intro(arxiv_id):
     """Download a paper's source and pull its Introduction section."""
+    import io
+    import tarfile
+
     source = download_arxiv_source(arxiv_id)
     try:
         tar = tarfile.open(fileobj=io.BytesIO(source), mode="r:*")
     except tarfile.TarError:
+        # Not a tar archive: maybe a single .tex file.
         text = source.decode("utf-8", errors="ignore")
         return get_introduction(text)
 
@@ -209,100 +151,8 @@ def extract_tex_intro(arxiv_id):
     return None
 
 
-def clean_latex(text):
-    """Strip LaTeX markup so the Introduction reads as plain prose."""
-    t = text
-    # drop full-line comments
-    t = re.sub(r"(?m)^\s*%.*?$", "", t)
-    # drop inline comments (\foo%comment)
-    t = re.sub(r"\\[a-zA-Z@]+\*?(\[[^\]]*\])?\{[^{}]*\}\s*%.*?$", "", t, flags=re.MULTILINE)
-    # paragraph breaks
-    t = re.sub(r"\\(?:par|newline)\b", "\n\n", t)
-    t = re.sub(r"\\\\", "\n\n", t)
-    # environments -> drop display-math environments entirely, keep prose envs' content
-    t = re.sub(
-        r"\\begin\{([a-zA-Z]*equation\*?|displaymath|multline\*?|"
-        r"align[a-zA-Z]*\*?|alignat[a-zA-Z]*\*?|gather[a-zA-Z]*\*?|"
-        r"eqnarray[a-zA-Z]*\*?|math\*?)\}"
-        r".*?\\end\{\1\}",
-        " ",
-        t,
-        flags=re.DOTALL,
-    )
-    t = re.sub(r"\\begin\{[^}]*\}\s*(\[[^\]]*\])?", " ", t)
-    t = re.sub(r"\\end\{[^}]*\}", " ", t)
-    # citations / references / labels -> drop entirely
-    t = re.sub(r"\\cite[a-z]*\*?(?:\[[^\]]*\])*\{[^}]*\}", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\\(?:footnote|endnote)\{", " (", t)
-    t = re.sub(r"\\footnote[^\{]", "", t)
-    t = re.sub(r"\\(?:footnotemark|thanks)\{", "", t)
-    t = re.sub(r"\\(?:ref|label|eqref|autoref|pageref)\*?\{[^}]*\}", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\\url\{([^}]*)\}", r"\1", t, flags=re.IGNORECASE)
-    t = re.sub(r"\\href\{[^}]*\}\{([^}]*)\}", r"\1", t, flags=re.IGNORECASE)
-    # formatting commands -> keep inner text
-    t = re.sub(
-        r"\\(?:textbf|emph|textit|texttt|textrm|textsc|textsf|textnormal|"
-        r"mbox|underline|mathrm|mathbf|mathcal|mathit|operatorname|footnote)\*?\{([^{}]*)\}",
-        r"\1",
-        t,
-    )
-    # math: strip inline and display math entirely (may span lines)
-    t = re.sub(r"\$\$.*?\$\$", "", t, flags=re.DOTALL)
-    t = re.sub(r"\\\[.*?\\\]", "", t, flags=re.DOTALL)
-    t = re.sub(r"\$[^$]*\$", "", t, flags=re.DOTALL)
-    # spacing / layout commands -> drop completely
-    t = re.sub(
-        r"\\(?:hspace|vspace|hphantom|vphantom|phantom|enspace|quad|qquad|"
-        r"smallskip|medskip|bigskip|linebreak|pagebreak|columnsep|parskip)\*?"
-        r"(\[[^\]]*\])?(\{[^{}]*\})?",
-        " ",
-        t,
-    )
-    t = re.sub(r"\\[,;! ]", " ", t)
-    # escaped symbols -> unescape
-    t = re.sub(r"\\\$", "$", t)
-    t = re.sub(r"\\%", "%", t)
-    t = re.sub(r"\\#", "#", t)
-    t = re.sub(r"\\_", "_", t)
-    t = re.sub(r"\\&", "&", t)
-    t = re.sub(r"\\~", "~", t)
-    t = re.sub(r"\\\^", "^", t)
-    # commands with a single-level argument -> keep the argument text
-    t = re.sub(r"\\[a-zA-Z@]+\*?(\[[^\]]*\])?\{([^{}]*)\}", r"\2", t)
-    # any residual named commands without arguments -> drop
-    t = re.sub(r"\\([a-zA-Z@])+", " ", t)
-    # any other braces and \left / \right
-    t = re.sub(r"[{}]", "", t)
-    t = re.sub(r"\\(?:left|right)\b", "", t)
-
-    # final whitespace polish
-    t = t.replace("~", " ")
-    t = re.sub(r"\s+\.", ".", t)
-    t = re.sub(r"\.\s*\.", ".", t)
-    t = re.sub(r"\s+,", ",", t)
-    t = re.sub(r"\s+;", ";", t)
-    t = re.sub(r"\s{3,}", "  ", t)
-
-    # collapse whitespace per line, preserve paragraph breaks
-    lines = [" ".join(ln.split()) for ln in t.split("\n")]
-    out = []
-    was_blank = False
-    for ln in lines:
-        if not ln:
-            was_blank = True
-            continue
-        if was_blank and out and out[-1]:
-            out.append("")
-        out.append(ln)
-        was_blank = False
-    return "\n".join(out).strip()
-
-
-def generate_gist(paper_title, intro):
+def generate_gist(paper_title, intro, api_key):
     from groq import Groq
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY environment variable not set")
     client = Groq(api_key=api_key)
     chat = client.chat.completions.create(
         messages=[
@@ -316,15 +166,22 @@ def generate_gist(paper_title, intro):
 
 
 # ---------------------------------------------------------------------------
-# Citations (OpenAlex — free, no API key)
+# Citations (OpenAlex — free, no API key; fallback to Semantic Scholar)
 # ---------------------------------------------------------------------------
 
-def fetch_citations(arxiv_ids, delay=0.5):
-    """Fetch citation counts for a list of arXiv ids via OpenAlex."""
+def fetch_citations(arxiv_ids, api_key=None, delay=0.5):
+    """Fetch citation counts for a list of arXiv ids.
+
+    Uses OpenAlex (no key needed) via the arXiv DOI; falls back to Semantic
+    Scholar if a key is provided. Newly submitted papers are usually not yet
+    indexed anywhere, so a 0/None result for very fresh papers is expected.
+    """
     ids = [i for i in arxiv_ids if i]
     if not ids:
         return {}
     counts = {}
+
+    # Primary: OpenAlex by arXiv DOI.
     for aid in ids:
         try:
             url = f"https://api.openalex.org/works/https://doi.org/10.48550/arxiv.{aid}"
@@ -333,87 +190,100 @@ def fetch_citations(arxiv_ids, delay=0.5):
                 counts[aid] = resp.json().get("cited_by_count", 0)
             else:
                 counts[aid] = 0
-        except Exception:
+        except Exception as e:
+            print(f"  openalex error {aid}: {e}")
             counts[aid] = None
         time.sleep(delay)
+
+    # Fallback: Semantic Scholar for any id OpenAlex did not resolve.
+    missing = [aid for aid, c in counts.items() if c is None]
+    if missing and api_key:
+        for aid in missing:
+            try:
+                resp = requests.get(
+                    f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{aid}",
+                    headers={"x-api-key": api_key},
+                    params={"fields": "citationCount"},
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    counts[aid] = resp.json().get("citationCount")
+                elif resp.status_code == 429:
+                    print(f"  rate-limited (429) for {aid}; sleeping 4s")
+                    time.sleep(4)
+                    counts[aid] = None
+                else:
+                    counts[aid] = None
+            except Exception as e:
+                print(f"  semantic scholar error {aid}: {e}")
+                counts[aid] = None
+            time.sleep(delay)
+    elif missing:
+        for aid in missing:
+            counts[aid] = 0
+
     return counts
 
 
 # ---------------------------------------------------------------------------
-# CLI batch mode (original pipeline)
+# Data store
 # ---------------------------------------------------------------------------
 
+def load_store():
+    if SITE_JSON.exists():
+        try:
+            return json.loads(SITE_JSON.read_text())
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
 def canonical_id(paper_or_rec):
+    """Return a version-stripped arXiv id for a Result or a site record."""
     if isinstance(paper_or_rec, str):
         sid = paper_or_rec
-    elif isinstance(paper_or_rec, dict):
-        u = (paper_or_rec.get("url") or "").lower()
+    elif hasattr(paper_or_rec, "get_short_id"):
+        sid = paper_or_rec.get_short_id()
+    else:
+        rec = paper_or_rec
+        u = (rec.get("url") or "").lower()
         if "arxiv.org/abs/" in u:
             sid = u.split("/abs/")[-1]
         else:
-            sid = paper_or_rec.get("short_id") or ""
-    else:
-        sid = ""
+            sid = rec.get("short_id") or ""
     sid = sid.lower().strip()
+    # strip trailing version like v1, v2
     return re.sub(r"v\d+$", "", sid) if re.search(r"v\d+$", sid) else sid
 
 
-def run_cli(args):
-    """Original batch pipeline: fetch papers, build gists, write data.json."""
-    import arxiv as arxiv_lib
+def known_ids(store):
+    """Set of canonical arXiv ids already present."""
+    ids = set()
+    for rec in store:
+        cid = canonical_id(rec)
+        if cid:
+            ids.add(cid)
+    return ids
 
-    groq_key = args.groq_key or os.environ.get("GROQ_API_KEY")
+
+def save_store(store):
+    SITE_JSON.parent.mkdir(parents=True, exist_ok=True)
+    SITE_JSON.write_text(json.dumps(store, indent=2, ensure_ascii=False))
+    print(f"Wrote {len(store)} records to {SITE_JSON}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fetch", type=int, default=100, help="number of latest papers to fetch")
+    parser.add_argument("--new", type=int, default=10, help="number of new papers to process with gists")
+    parser.add_argument("--groq-key", default=None, help="GROQ_API_KEY")
+    parser.add_argument("--s2-key", default=None, help="Semantic Scholar API key (optional)")
+    args = parser.parse_args()
+
+    groq_key = args.groq_key or __import__("os").environ.get("GROQ_API_KEY")
     if not groq_key:
         print("ERROR: no GROQ_API_KEY provided (use --groq-key or env var).")
         sys.exit(1)
-
-    def arxiv_client():
-        return arxiv_lib.Client(page_size=100, delay_seconds=3, num_retries=3)
-
-    def fetch_latest_n(max_results=100):
-        client = arxiv_client()
-        search = arxiv_lib.Search(
-            query=ARXIV_SEARCH_QUERY,
-            max_results=max_results,
-            sort_by=arxiv_lib.SortCriterion.SubmittedDate,
-            sort_order=arxiv_lib.SortOrder.Descending,
-        )
-        papers = list(client.results(search))
-        papers.sort(key=lambda p: p.published, reverse=True)
-        return papers
-
-    def paper_to_meta(paper):
-        return {
-            "title": paper.title.strip(),
-            "field": "Large Language Models",
-            "published": paper.published.isoformat(),
-            "url": paper.entry_id,
-            "short_id": paper.get_short_id(),
-            "summary": paper.summary.strip(),
-            "citations": None,
-            "has_gist": False,
-        }
-
-    def load_store():
-        if SITE_JSON.exists():
-            try:
-                return json.loads(SITE_JSON.read_text())
-            except json.JSONDecodeError:
-                return []
-        return []
-
-    def save_store(store):
-        SITE_JSON.parent.mkdir(parents=True, exist_ok=True)
-        SITE_JSON.write_text(json.dumps(store, indent=2, ensure_ascii=False))
-        print(f"Wrote {len(store)} records to {SITE_JSON}")
-
-    def known_ids(store):
-        ids = set()
-        for rec in store:
-            cid = canonical_id(rec)
-            if cid:
-                ids.add(cid)
-        return ids
 
     print(f"Fetching latest {args.fetch} 'large language model' papers...")
     fetched = fetch_latest_n(args.fetch)
@@ -423,6 +293,7 @@ def run_cli(args):
     existing = known_ids(store)
     print(f"Existing processed ids in data.json: {len(existing)}")
 
+    # Determine NEW candidates (not yet in store), newest first.
     new_candidates = []
     for p in fetched:
         base = canonical_id(p)
@@ -438,9 +309,11 @@ def run_cli(args):
         print(f"\n[{idx}/{len(to_process)}] {paper.title.strip()[:70]}")
         record = paper_to_meta(paper)
 
-        cites = fetch_citations([sid])
+        # Citation count first (best-effort).
+        cites = fetch_citations([sid], api_key=args.s2_key)
         record["citations"] = cites.get(sid)
 
+        # Gist from the Introduction.
         intro = None
         try:
             intro = extract_tex_intro(sid)
@@ -449,15 +322,8 @@ def run_cli(args):
 
         if intro:
             try:
-                chat = __import__("groq").Groq(api_key=groq_key).chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": f"Paper title:\n{paper.title.strip()}\n\nIntroduction:\n{intro}"},
-                    ],
-                    model=GROQ_MODEL,
-                    reasoning_effort="none",
-                )
-                record["gist"] = chat.choices[0].message.content
+                gist = generate_gist(paper.title.strip(), intro, groq_key)
+                record["gist"] = gist
                 record["has_gist"] = True
             except Exception as e:
                 print(f"  gist failed: {e}")
@@ -468,6 +334,13 @@ def run_cli(args):
         newly_built.append(record)
         existing.add(sid)
 
+    # Merge strategy:
+    #   1. Build a map of canonical id -> best record from the existing store.
+    #      Prefer records that already carry a gist.
+    #   2. Fold in the newly built records (they should win for their ids).
+    #   3. For every fetched paper, guarantee one metadata record exists
+    #      (so the site lists all 100), merging any existing gist in.
+    #   4. Keep store records whose ids are not among the fetched ones too.
     unified = {}
     for rec in store:
         cid = canonical_id(rec)
@@ -496,10 +369,13 @@ def run_cli(args):
             rec["summary"] = p.summary.strip()
             unified[cid] = rec
         else:
+            # Ensure canonical url/id even for gist records.
             rec.setdefault("url", p.entry_id)
             rec.setdefault("short_id", p.get_short_id())
 
     merged = list(unified.values())
+
+    # Sort newest first, keyed on whichever date is present.
     def parsed(rec):
         try:
             return __import__("datetime").datetime.fromisoformat(rec["published"])
@@ -513,103 +389,5 @@ def run_cli(args):
     print(f"New papers processed this run: {len(newly_built)}")
 
 
-# ---------------------------------------------------------------------------
-# Flask API server
-# ---------------------------------------------------------------------------
-
-app = Flask(__name__)
-CORS(app)
-
-_papers_cache = None
-
-
-@app.route("/api/papers", methods=["GET"])
-def api_papers():
-    """Return the latest arXiv papers as JSON. Fetched live from arXiv."""
-    global _papers_cache
-    try:
-        max_results = request.args.get("max", 100, type=int)
-        max_results = min(max_results, 200)
-
-        _papers_cache = fetch_papers_from_arxiv(max_results)
-        return jsonify(_papers_cache)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/gist", methods=["POST"])
-def api_gist():
-    """Generate a learning gist for a paper on the fly via Groq."""
-    data = request.get_json()
-    if not data or "arxiv_id" not in data:
-        return jsonify({"error": "Missing arxiv_id"}), 400
-
-    arxiv_id = data["arxiv_id"]
-    paper_title = data.get("title", "Unknown Paper")
-
-    # Download TeX source and extract Introduction
-    try:
-        intro = extract_tex_intro(arxiv_id)
-    except Exception as e:
-        return jsonify({"error": f"Failed to download/parse source: {e}"}), 500
-
-    if not intro:
-        return jsonify({"error": "Could not extract Introduction from the paper's TeX source."}), 404
-
-    # Generate gist via Groq
-    try:
-        gist = generate_gist(paper_title, intro)
-        return jsonify({"gist": gist})
-    except Exception as e:
-        return jsonify({"error": f"Groq API error: {e}"}), 500
-
-
-@app.route("/api/intro", methods=["POST"])
-def api_intro():
-    """Fetch a paper's actual \\section{Introduction} verbatim from its TeX source."""
-    data = request.get_json()
-    if not data or "arxiv_id" not in data:
-        return jsonify({"error": "Missing arxiv_id"}), 400
-
-    arxiv_id = data["arxiv_id"]
-
-    try:
-        intro = extract_tex_intro(arxiv_id)
-    except Exception as e:
-        return jsonify({"error": f"Failed to download/parse source: {e}"}), 500
-
-    if not intro:
-        return jsonify({"error": "Could not extract Introduction from the paper's TeX source."}), 404
-
-    return jsonify({"intro": intro, "clean": clean_latex(intro)})
-
-
-@app.route("/api/health", methods=["GET"])
-def api_health():
-    return jsonify({"status": "ok"})
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Paper Gist server or CLI pipeline")
-    parser.add_argument("--cli", action="store_true", help="Run in CLI batch mode instead of API server")
-    parser.add_argument("--port", type=int, default=5000, help="Port for the API server (default: 5000)")
-    parser.add_argument("--host", default="127.0.0.1", help="Host for the API server (default: 127.0.0.1)")
-    parser.add_argument("--fetch", type=int, default=100, help="[CLI] number of latest papers to fetch")
-    parser.add_argument("--new", type=int, default=10, help="[CLI] number of new papers to process with gists")
-    parser.add_argument("--groq-key", default=None, help="[CLI] GROQ_API_KEY")
-    parser.add_argument("--s2-key", default=None, help="[CLI] Semantic Scholar API key (optional)")
-    args = parser.parse_args()
-
-    if args.cli:
-        run_cli(args)
-    else:
-        print(f"Starting Paper Gist API on http://{args.host}:{args.port}")
-        print("Endpoints:")
-        print(f"  GET  http://{args.host}:{args.port}/api/papers")
-        print(f"  POST http://{args.host}:{args.port}/api/gist")
-        print(f"  POST http://{args.host}:{args.port}/api/intro")
-        app.run(host=args.host, port=args.port)
+    main()
