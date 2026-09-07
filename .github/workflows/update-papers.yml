@@ -4,7 +4,7 @@ on:
   schedule:
     # Every 4 hours. GitHub only guarantees best-effort timing for scheduled
     # jobs (they can be delayed during high load on the GitHub infrastructure).
-    - cron: "0 */4 * * *"
+    - cron: "0 16 * * *"
   workflow_dispatch: # allow manual trigger from the Actions tab
 
 # Only one run at a time; cancel in-progress if a new one starts (avoids
