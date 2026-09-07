@@ -14,13 +14,18 @@ import json
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
-import arxiv
 import requests
 
 SITE_JSON = Path(__file__).resolve().parent / "site" / "data.json"
 GROQ_MODEL = "qwen/qwen3.6-27b"
+
+ARXIV_API = "https://export.arxiv.org/api/query"
+ARXIV_UA = "PaperGist pipeline (https://github.com/sobhonium/papergist; scheduled refresh)"
+ARXIV_NS = {"a": "http://www.w3.org/2005/Atom"}
 
 SYSTEM_PROMPT = """You are an expert research tutor who writes for advanced undergraduates.
 
@@ -76,31 +81,76 @@ STYLE RULES:
 # arXiv fetching
 # ---------------------------------------------------------------------------
 
-def arxiv_client():
-    return arxiv.Client(page_size=100, delay_seconds=3, num_retries=3)
+def arxiv_query(params, attempts=6, base_wait=3):
+    """GET the arXiv Atom API with a descriptive UA and exponential backoff.
+
+    arXiv aggressively rate-limits shared IPs (429/503). We retry with
+    increasing waits and also treat an empty feed as transient so a throttled
+    response can never silently masquerade as "no new papers".
+    """
+    headers = {"User-Agent": ARXIV_UA}
+    for attempt in range(attempts):
+        try:
+            resp = requests.get(ARXIV_API, params=params, headers=headers, timeout=45)
+            if resp.status_code == 200 and id_list(resp.text):
+                return resp.text
+            state = "empty response" if resp.status_code == 200 else f"HTTP {resp.status_code}"
+        except Exception as e:
+            state = f"request error ({e.__class__.__name__})"
+        wait = base_wait * (2 ** attempt)
+        print(f"  arXiv {state} — retry {attempt + 1}/{attempts} in {wait}s")
+        time.sleep(wait)
+    return None
+
+
+def id_list(feed_xml):
+    return re.findall(r"<id>http://arxiv.org/abs/([^<]+)</id>", feed_xml)
+
+
+def parse_feed(feed_xml):
+    """Parse an arXiv Atom feed into lightweight paper objects."""
+    root = ET.fromstring(feed_xml)
+    papers = []
+    for entry in root.findall("a:entry", ARXIV_NS):
+        aid = entry.findtext("a:id", default="", namespaces=ARXIV_NS)
+        abs_id = aid.split("/abs/")[-1] if aid else ""
+        if not abs_id:
+            continue
+        papers.append(
+            SimpleNamespace(
+                title=" ".join(entry.findtext("a:title", default="", namespaces=ARXIV_NS).split()),
+                summary=" ".join(entry.findtext("a:summary", default="", namespaces=ARXIV_NS).split()),
+                published=entry.findtext("a:published", default="", namespaces=ARXIV_NS).strip(),
+                entry_id=f"http://arxiv.org/abs/{abs_id}",
+                get_short_id=lambda _id=abs_id: _id,
+            )
+        )
+    return papers
 
 
 def fetch_latest_n(max_results=100):
     """Return the latest `max_results` papers matching 'large language model'."""
-    client = arxiv_client()
-    search = arxiv.Search(
-        query='all:"large language model"',
-        max_results=max_results,
-        sort_by=arxiv.SortCriterion.SubmittedDate,
-        sort_order=arxiv.SortOrder.Descending,
+    feed = arxiv_query(
+        params={
+            "search_query": 'all:"large language model"',
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+            "max_results": max_results,
+        }
     )
-    papers = list(client.results(search))
-    # arxiv returns newest first; be defensive and sort by published desc.
+    if feed is None:
+        raise RuntimeError("arXiv API unreachable after all retries — no update performed.")
+    papers = parse_feed(feed)
     papers.sort(key=lambda p: p.published, reverse=True)
     return papers
 
 
 def paper_to_meta(paper):
-    """Convert an arxiv Result into a site record (no gist yet)."""
+    """Convert an arXiv Result into a site record (no gist yet)."""
     return {
         "title": paper.title.strip(),
         "field": "Large Language Models",
-        "published": paper.published.isoformat(),
+        "published": paper.published,
         "url": paper.entry_id,
         "short_id": paper.get_short_id(),
         "summary": paper.summary.strip(),
@@ -119,9 +169,21 @@ def get_introduction(tex):
     return match.group(1).strip() if match else None
 
 
-def download_arxiv_source(arxiv_id, timeout=60):
+def download_arxiv_source(arxiv_id, timeout=60, attempts=4):
     url = f"https://export.arxiv.org/e-print/{arxiv_id}"
-    resp = requests.get(url, timeout=timeout)
+    headers = {"User-Agent": ARXIV_UA}
+    for attempt in range(attempts):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                return resp.content
+            state = f"HTTP {resp.status_code}"
+        except Exception as e:
+            state = f"request error ({e.__class__.__name__})"
+        wait = 2
+        print(f"  source download {state} — retry {attempt + 1}/{attempts} in {wait}s")
+        time.sleep(wait)
+    resp = requests.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()
     return resp.content
 
@@ -365,7 +427,7 @@ def main():
             rec = paper_to_meta(p)
             rec["short_id"] = p.get_short_id()
             rec["url"] = p.entry_id
-            rec["published"] = p.published.isoformat()
+            rec["published"] = p.published
             rec["summary"] = p.summary.strip()
             unified[cid] = rec
         else:
